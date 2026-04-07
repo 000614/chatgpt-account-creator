@@ -1,276 +1,261 @@
 /**
  * lib/register.js
- * Flow registrasi akun ChatGPT (6 step).
- * Menggunakan browser.js untuk setup browser.
+ * Full ChatGPT account registration via direct HTTP fetch.
+ * No browser required — pure API calls based on HAR analysis.
  *
- * Step 1: chatgpt.com → CSRF token → signin/openai → auth0 URL
- * Step 2: Isi password
- * Step 3: Tunggu + isi OTP
- * Step 4: Isi nama & tanggal lahir
- * Step 5: Ambil session credentials
- * Step 6: Return hasil & tutup browser
- *
- * Progress dilaporkan via onProgress(step, message) callback.
+ * Flow:
+ *  1. GET  chatgpt.com/api/auth/csrf            → csrfToken
+ *  2. POST chatgpt.com/api/auth/signin/openai    → OAuth authorize URL
+ *  3. GET  authorize URL → 302 chain             → capture auth cookies
+ *  4. POST auth.openai.com/.../user/register      → trigger OTP
+ *  5. GET  auth.openai.com/.../email-otp/send     → send OTP email
+ *  6. POST auth.openai.com/.../email-otp/validate → validate OTP
+ *  7. POST auth.openai.com/.../create_account     → finalize + callback URL
+ *  8. GET  chatgpt.com/api/auth/callback          → session cookies
+ *  9. GET  chatgpt.com/api/auth/session           → access token
  */
 
-import {
-  launchBrowser,
-  waitForAnySelector,
-  clickButton,
-  sleep,
-} from "./browser.js";
+import { randomUUID } from "crypto";
+import { CookieJar, fetchCookie, fetchRedirect } from "./http-client.js";
 
-const CHATGPT_BASE = "https://chatgpt.com";
-export const TOTAL_STEPS = 6;
+export const TOTAL_STEPS = 7;
 
 /**
- * Registrasi akun ChatGPT.
- * @param {{ email, password, fullName, firstName, lastName }} account
- * @param {{ askOtpFn: Function, onProgress?: Function }} opts
- * @returns {Promise<Object>} data akun hasil registrasi
+ * Register a ChatGPT account via fetch (no browser).
+ * @param {{ email: string, password: string, fullName: string }} account
+ * @param {{ askOtpFn: (email:string)=>Promise<string>, onProgress?: (step:number,msg:string)=>void }} opts
+ * @returns {Promise<Object>} account data with session info
  */
 export async function registerAccount(account, opts = {}) {
   const { email, password, fullName } = account;
   const { askOtpFn, onProgress } = opts;
+  const progress = (step, msg) => onProgress?.(step, msg);
 
-  const progress = (step, msg) => {
-    if (onProgress) onProgress(step, msg);
+  const jar = new CookieJar();
+  const deviceId = randomUUID();
+  const sessionLogId = randomUUID();
+
+  const authHeaders = {
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    Referer: "https://chatgpt.com/",
   };
 
-  progress(0, "Launching browser...");
-  const { browser, page } = await launchBrowser();
+  const apiHeaders = (referer) => ({
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    Origin: "https://auth.openai.com",
+    Referer: referer,
+  });
 
-  try {
-    // ── Step 1: Setup OAuth & buka halaman password ───────────────────────
-    progress(1, "Setup OAuth & buka halaman password");
+  // ── Step 1: CSRF token ──────────────────────────────────────────────────
+  progress(1, "Mengambil CSRF token...");
 
-    await page.goto(CHATGPT_BASE, {
-      waitUntil: "domcontentloaded",
-      timeout: 20000,
-    });
+  const csrfRes = await fetchCookie(jar, "https://chatgpt.com/api/auth/csrf", {
+    headers: { Accept: "*/*", Referer: "https://chatgpt.com/" },
+  });
+  const { csrfToken } = await csrfRes.json();
+  if (!csrfToken) throw new Error("CSRF token tidak diperoleh");
+  progress(1, "CSRF token OK ✓");
 
-    const csrfToken = await page.evaluate(async () => {
-      const res = await fetch("/api/auth/csrf", { credentials: "include" });
-      const { csrfToken } = await res.json();
-      return csrfToken;
-    });
-    if (!csrfToken) throw new Error("CSRF token tidak diperoleh");
+  // ── Step 2: OAuth signin → authorize URL ────────────────────────────────
+  progress(2, "Memulai OAuth signin...");
 
-    const signinResult = await page.evaluate(
-      async (csrf, email) => {
-        const params = new URLSearchParams({
-          prompt: "login",
-          screen_hint: "signup",
-          login_hint: email,
-        });
-        const body = new URLSearchParams({
-          callbackUrl: "https://chatgpt.com/",
-          csrfToken: csrf,
-          json: "true",
-        });
-        const res = await fetch(`/api/auth/signin/openai?${params}`, {
-          method: "POST",
-          credentials: "include",
-          headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-            Accept: "application/json",
-          },
-          body: body.toString(),
-        });
-        const { url } = await res.json();
-        return { ok: res.ok, url };
+  const signinParams = new URLSearchParams({
+    prompt: "login",
+    "ext-oai-did": deviceId,
+    auth_session_logging_id: sessionLogId,
+    "ext-passkey-client-capabilities": "0101",
+    screen_hint: "login_or_signup",
+    login_hint: email,
+  });
+
+  const signinRes = await fetchCookie(
+    jar,
+    `https://chatgpt.com/api/auth/signin/openai?${signinParams}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "*/*",
+        Origin: "https://chatgpt.com",
+        Referer: "https://chatgpt.com/",
       },
-      csrfToken,
-      email,
-    );
+      body: new URLSearchParams({
+        callbackUrl: "https://chatgpt.com/",
+        csrfToken,
+        json: "true",
+      }).toString(),
+    },
+  );
 
-    if (!signinResult.url)
-      throw new Error("URL auth0 tidak diperoleh dari signin/openai");
+  const { url: authorizeUrl } = await signinRes.json();
+  if (!authorizeUrl) throw new Error("URL OAuth tidak diperoleh");
+  progress(2, "OAuth URL OK ✓");
 
-    await page.goto(signinResult.url, {
-      waitUntil: "networkidle0",
-      timeout: 30000,
-    });
-    progress(1, 'Halaman "Create a password" terbuka');
+  // ── Step 3: Follow authorize → password page (capture cookies) ──────────
+  progress(3, "Membuka halaman registrasi...");
 
-    // ── Step 2: Isi password ──────────────────────────────────────────────
-    progress(2, "Mengisi password...");
+  const { response: pwPage } = await fetchRedirect(jar, authorizeUrl, {
+    headers: authHeaders,
+  });
+  await pwPage.text();
+  progress(3, "Halaman registrasi terbuka ✓");
 
-    const pwFound = await waitForAnySelector(
-      page,
-      [
-        'input[name="new-password"]',
-        'input[type="password"]',
-        'input[name="password"]',
-      ],
-      10000,
-    );
+  // ── Step 4: Register email + password ───────────────────────────────────
+  progress(4, "Mendaftarkan email & password...");
 
-    if (!pwFound) {
-      throw new Error(`Password field tidak ditemukan. URL: ${page.url()}`);
-    }
+  const regRes = await fetchCookie(
+    jar,
+    "https://auth.openai.com/api/accounts/user/register",
+    {
+      method: "POST",
+      headers: apiHeaders("https://auth.openai.com/create-account/password"),
+      body: JSON.stringify({ password, username: email }),
+    },
+  );
 
-    await page.click(pwFound.selector, { clickCount: 3 });
-    await page.keyboard.press("Backspace");
-    await page.type(pwFound.selector, password, { delay: 50 });
-    await sleep(300);
+  const regData = await regRes.json();
+  if (!regData.continue_url) {
+    throw new Error(`Register gagal: ${JSON.stringify(regData)}`);
+  }
+  progress(4, "Email & password terdaftar ✓");
 
-    const clicked = await clickButton(page, ["continue", "lanjut", "next"]);
-    if (!clicked) await page.keyboard.press("Enter");
-    progress(2, "Password diisi → OTP dikirim ke email");
+  // ── Step 5: Send OTP email + wait (with resend) ─────────────────────────
+  progress(5, "Mengirim OTP ke email...");
 
-    // ── Step 3: Tunggu & isi OTP ──────────────────────────────────────────
-    progress(3, "Menunggu halaman OTP...");
+  const { response: otpPage } = await fetchRedirect(jar, regData.continue_url, {
+    headers: {
+      ...authHeaders,
+      Referer: "https://auth.openai.com/create-account/password",
+    },
+  });
+  await otpPage.text();
 
-    const otpFound = await waitForAnySelector(
-      page,
-      [
-        'input[name="code"]',
-        'input[autocomplete="one-time-code"]',
-        'input[inputmode="numeric"]',
-        'input[type="text"]:not([placeholder*="mail" i])',
-      ],
-      30000,
-    );
+  // Poll OTP with resend: try 10s → resend → 10s → resend → 10s → give up
+  const OTP_POLL_MS = 10_000;
+  const MAX_RESENDS = 2;
+  let otpCode = null;
 
-    if (!otpFound) {
-      throw new Error(`OTP field tidak ditemukan. URL: ${page.url()}`);
-    }
-
-    progress(3, "Menunggu kode OTP dari email...");
-    const otpCode = await askOtpFn(email);
-
-    await page.click(otpFound.selector, { clickCount: 3 });
-    await page.type(otpFound.selector, otpCode.trim(), { delay: 80 });
-    await sleep(300);
-
-    const otpClicked = await clickButton(page, [
-      "continue",
-      "verify",
-      "submit",
-      "confirm",
-      "next",
-    ]);
-    if (!otpClicked) await page.keyboard.press("Enter");
-
-    await Promise.race([
-      page.waitForFunction(
-        () => window.location.pathname.includes("about-you"),
-        { timeout: 20000 },
-      ),
-      page.waitForSelector('input[name="name"]', { timeout: 20000 }),
-    ]).catch(() => {});
-
-    progress(3, "OTP valid ✓");
-
-    // ── Step 4: Isi nama & tanggal lahir ─────────────────────────────────
-    progress(4, "Mengisi nama & tanggal lahir...");
-    await sleep(1500);
-
-    const nameEl = await page.$('input[name="name"]').catch(() => null);
-    if (nameEl) {
-      await nameEl.click({ clickCount: 3 });
-      await page.keyboard.press("Backspace");
-      await page.type('input[name="name"]', fullName, { delay: 50 });
-    }
-
-    const year = 2000 + Math.floor(Math.random() * 6);
-    const month = Math.floor(Math.random() * 12) + 1;
-    const day = Math.floor(Math.random() * 28) + 1;
-    const birthdate = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-    const birthdateDisplay = `${String(month).padStart(2, "0")}/${String(day).padStart(2, "0")}/${year}`;
-
-    const spinbtns = await page.$$('[role="spinbutton"]');
-    if (spinbtns.length >= 3) {
-      await spinbtns[0].click();
-      await page.keyboard.type(String(month).padStart(2, "0"));
-      await sleep(200);
-      await spinbtns[1].click();
-      await page.keyboard.type(String(day).padStart(2, "0"));
-      await sleep(200);
-      await spinbtns[2].click();
-      await page.keyboard.type(String(year));
-      await sleep(200);
-    } else {
-      const bday = await page.$(
-        '[aria-label*="Birthday" i], [placeholder*="Birthday" i]',
+  for (let attempt = 0; attempt <= MAX_RESENDS; attempt++) {
+    if (attempt > 0) {
+      progress(5, `Resend OTP (${attempt}/${MAX_RESENDS})...`);
+      await fetchCookie(
+        jar,
+        "https://auth.openai.com/api/accounts/email-otp/resend",
+        {
+          method: "POST",
+          headers: {
+            Accept: "*/*",
+            Origin: "https://auth.openai.com",
+            Referer: "https://auth.openai.com/email-verification",
+          },
+        },
       );
-      if (bday) {
-        await bday.click();
-        await page.keyboard.type(String(month).padStart(2, "0"));
-        await sleep(100);
-        await page.keyboard.type(String(day).padStart(2, "0"));
-        await sleep(100);
-        await page.keyboard.type(String(year));
-      }
     }
 
-    await sleep(600);
+    progress(5, attempt > 0
+      ? `Menunggu OTP (resend ${attempt})...`
+      : "Menunggu kode OTP dari email...");
 
-    const finishClicked = await clickButton(page, [
-      "finish",
-      "agree",
-      "done",
-      "create account",
-      "continue",
-    ]);
-    if (!finishClicked) await page.keyboard.press("Enter");
-
-    await page
-      .waitForFunction(
-        () =>
-          window.location.hostname === "chatgpt.com" ||
-          window.location.pathname === "/",
-        { timeout: 15000 },
-      )
-      .catch(() => {});
-
-    await sleep(2000);
-    progress(4, `Profil: ${fullName}, lahir ${birthdateDisplay}`);
-
-    // ── Step 5: Ambil session credentials ────────────────────────────────
-    progress(5, "Mengambil session credentials...");
-
-    if (!page.url().includes("chatgpt.com")) {
-      await page.goto("https://chatgpt.com", {
-        waitUntil: "domcontentloaded",
-        timeout: 20000,
-      });
-      await sleep(2000);
-    }
-
-    const session = await page.evaluate(async () => {
-      try {
-        const res = await fetch("/api/auth/session", {
-          credentials: "include",
-        });
-        if (!res.ok) return null;
-        return res.json();
-      } catch {
-        return null;
+    try {
+      otpCode = await Promise.race([
+        askOtpFn(email),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("timeout")), OTP_POLL_MS),
+        ),
+      ]);
+      if (otpCode) break;
+    } catch {
+      if (attempt === MAX_RESENDS) {
+        throw new Error("OTP tidak diterima setelah 2x resend");
       }
-    });
+    }
+  }
 
-    let sessionData = {};
+  progress(5, "OTP diterima ✓");
+
+  // ── Step 6: Validate OTP ────────────────────────────────────────────────
+  progress(6, "Memvalidasi kode OTP...");
+
+  const valRes = await fetchCookie(
+    jar,
+    "https://auth.openai.com/api/accounts/email-otp/validate",
+    {
+      method: "POST",
+      headers: apiHeaders("https://auth.openai.com/email-verification"),
+      body: JSON.stringify({ code: otpCode.trim() }),
+    },
+  );
+
+  const valData = await valRes.json();
+  if (!valData.continue_url) {
+    throw new Error(`OTP validasi gagal: ${JSON.stringify(valData)}`);
+  }
+  progress(6, "OTP valid ✓");
+
+  // Visit about-you page (capture cookies for next step)
+  const { response: aboutPage } = await fetchRedirect(jar, valData.continue_url, {
+    headers: {
+      ...authHeaders,
+      Referer: "https://auth.openai.com/email-verification",
+    },
+  });
+  await aboutPage.text();
+
+  // ── Step 7: Create account (name + birthdate) ───────────────────────────
+  progress(7, "Membuat akun...");
+
+  const year = 2000 + Math.floor(Math.random() * 6);
+  const month = Math.floor(Math.random() * 12) + 1;
+  const day = Math.floor(Math.random() * 28) + 1;
+  const birthdate = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+
+  const createRes = await fetchCookie(
+    jar,
+    "https://auth.openai.com/api/accounts/create_account",
+    {
+      method: "POST",
+      headers: apiHeaders("https://auth.openai.com/about-you"),
+      body: JSON.stringify({ name: fullName, birthdate }),
+    },
+  );
+
+  const createData = await createRes.json();
+  if (!createData.continue_url) {
+    throw new Error(`Create account gagal: ${JSON.stringify(createData)}`);
+  }
+
+  // ── Callback: Complete OAuth → session ──────────────────────────────────
+  const callbackUrl =
+    createData.page?.payload?.url || createData.continue_url;
+
+  const { response: cbRes } = await fetchRedirect(jar, callbackUrl, {
+    headers: { ...authHeaders, Referer: "https://auth.openai.com/" },
+  });
+  await cbRes.text();
+
+  // Get session (access token)
+  let sessionData = {};
+  try {
+    const sessRes = await fetchCookie(
+      jar,
+      "https://chatgpt.com/api/auth/session",
+      { headers: { Accept: "application/json", Referer: "https://chatgpt.com/" } },
+    );
+    const session = await sessRes.json();
     if (session?.accessToken) {
       sessionData = {
         userId: session.user?.id,
-        accountId: session.account?.id,
-        organizationId: session.account?.organizationId,
-        planType: session.account?.planType,
         accessToken: session.accessToken,
         expires: session.expires,
       };
-      progress(5, `Session OK — plan: ${session.account?.planType || "free"}`);
-    } else {
-      progress(5, "Session tidak diperoleh (akun tetap tersimpan)");
     }
-
-    // ── Step 6: Selesai ───────────────────────────────────────────────────
-    progress(6, "Berhasil ✅");
-
-    return { ...account, birthdate, status: "verified", ...sessionData };
-  } finally {
-    await browser.close();
+  } catch {
+    // Session retrieval optional
   }
+
+  const birthdateDisplay = `${String(month).padStart(2, "0")}/${String(day).padStart(2, "0")}/${year}`;
+  progress(7, `Berhasil ✅ (lahir: ${birthdateDisplay})`);
+
+  return { ...account, birthdate, status: "verified", ...sessionData };
 }

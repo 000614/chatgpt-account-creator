@@ -2,7 +2,6 @@
   "password": "@Gopretstudio88",
   "domains": ["plexai.xyz"],
   "batchSize": 5,
-  "headless": false,
   "otp": {
     "timeout": 90000,
     "pollInterval": 4000,

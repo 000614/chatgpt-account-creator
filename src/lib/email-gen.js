@@ -2,7 +2,8 @@
  * lib/email-gen.js
  * Generate email, nama, dan password untuk akun baru.
  *
- * - Nama dari faker.js, semua simbol dibuang
+ * - Nama dari faker.js, hanya huruf/spasi
+ * - Email memakai firstName + lastName dari hasil generate nama
  * - emailSuffix ditambahkan ke username email
  */
 
@@ -11,38 +12,41 @@ import { PASSWORD, DOMAINS } from "../config.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function randomUsername(length = 10) {
-  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-  return Array.from(
-    { length },
-    () => chars[Math.floor(Math.random() * chars.length)],
-  ).join("");
+function normalizeSpaces(value) {
+  return value.replace(/\s+/g, " ").trim();
 }
 
-/** Hapus semua karakter selain huruf dan spasi */
-function cleanName(name) {
-  return name.replace(/[^a-zA-Z\s]/g, "").trim();
+function isPlainName(name) {
+  return /^[A-Za-z]+(?: [A-Za-z]+)*$/.test(name);
+}
+
+function sanitizeName(name) {
+  return normalizeSpaces(name.replace(/[^A-Za-z\s]/g, " "));
+}
+
+function generateSafeNamePart(generator) {
+  let name = "";
+  do {
+    name = normalizeSpaces(generator());
+  } while (!isPlainName(name));
+  return name;
+}
+
+function toEmailPart(name) {
+  return sanitizeName(name).toLowerCase().replace(/\s+/g, "");
 }
 
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
-export function generateEmail(emailSuffix = "") {
-  const domain = DOMAINS[Math.floor(Math.random() * DOMAINS.length)];
-  const username = randomUsername(10) + emailSuffix;
+export function generateEmail(firstName, lastName, emailSuffix = "") {
+  const domain = faker.helpers.arrayElement(DOMAINS);
+  const username = `${toEmailPart(firstName)}${toEmailPart(lastName)}${emailSuffix}`;
   return `${username}@${domain}`;
 }
 
 export function generateName() {
-  let first, last;
-
-  // Generate sampai dapat nama bersih tanpa simbol
-  do {
-    first = cleanName(faker.person.firstName());
-  } while (!first);
-
-  do {
-    last = cleanName(faker.person.lastName());
-  } while (!last);
+  const first = generateSafeNamePart(() => faker.person.firstName());
+  const last = generateSafeNamePart(() => faker.person.lastName());
 
   return { firstName: first, lastName: last, fullName: `${first} ${last}` };
 }
@@ -51,7 +55,7 @@ export function generateName() {
 export function generateAccount(emailSuffix = "") {
   const { firstName, lastName, fullName } = generateName();
   return {
-    email: generateEmail(emailSuffix),
+    email: generateEmail(firstName, lastName, emailSuffix),
     password: PASSWORD,
     firstName,
     lastName,

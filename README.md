@@ -4,11 +4,11 @@
 
 # ChatGPT Account Creator
 
-**Alat CLI untuk otomatisasi pembuatan akun ChatGPT secara massal via browser headless.**
+**Alat CLI untuk otomatisasi pembuatan akun ChatGPT secara massal via HTTP fetch (tanpa browser).**
 
-![Version](https://img.shields.io/badge/Version-3.0.0-blueviolet)
+![Version](https://img.shields.io/badge/Version-4.0.0-blueviolet)
 ![Node](https://img.shields.io/badge/Node.js-v18+-green)
-![Runtime](https://img.shields.io/badge/Runtime-Puppeteer-orange)
+![Runtime](https://img.shields.io/badge/Runtime-Fetch_API-blue)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
 
 [Fitur](#fitur-utama) - [Instalasi](#instalasi) - [Penggunaan](#penggunaan) - [Struktur](#struktur-project) - [Lisensi](#lisensi)
@@ -19,28 +19,29 @@
 
 ---
 
-> **Disclaimer:** Project ini dibuat semata-mata untuk tujuan **pembelajaran dan riset otomatisasi browser**. Penggunaan alat ini untuk tindakan yang melanggar Ketentuan Layanan OpenAI, penyalahgunaan platform, atau aktivitas ilegal lainnya sepenuhnya menjadi tanggung jawab pengguna. Penulis tidak bertanggung jawab atas segala bentuk penyalahgunaan.
+> **Disclaimer:** Project ini dibuat semata-mata untuk tujuan **pembelajaran dan riset otomatisasi**. Penggunaan alat ini untuk tindakan yang melanggar Ketentuan Layanan OpenAI, penyalahgunaan platform, atau aktivitas ilegal lainnya sepenuhnya menjadi tanggung jawab pengguna. Penulis tidak bertanggung jawab atas segala bentuk penyalahgunaan.
 
 ---
 
 ## Fitur Utama
 
-- Pembuatan akun ChatGPT secara otomatis via web flow resmi
-- Pemrosesan paralel hingga 5 akun secara bersamaan (batch processing)
+- Pembuatan akun ChatGPT secara otomatis via **direct HTTP fetch** (tanpa browser)
+- **Jauh lebih cepat** dibanding versi browser — murni API call
+- Pemrosesan paralel hingga 5 akun secara bersamaan dengan worker pool
 - **Live progress bar** per-akun dengan tampilan ANSI real-time
 - Verifikasi OTP otomatis dari inbox email via API
-- **Nama random realistis** menggunakan faker.js (tanpa simbol)
+- **Auto-resend OTP** — jika OTP tidak masuk dalam 10 detik, otomatis resend hingga 2 kali
+- **Nama random realistis** menggunakan faker.js (huruf/spasi saja, tanpa simbol)
 - **Email unik** — LocalDB memastikan tidak ada email duplikat antar sesi
-- **Suffix email opsional** — tambahkan nama di belakang email (contoh: `abc123wahid@domain.xyz`)
-- Auto-retry tanpa batas jika gagal (buat akun baru otomatis, tanpa tampilan error)
+- **Email berbasis nama** — username email memakai kombinasi nama depan + nama belakang hasil faker.js
+- **Suffix email opsional** — tambahkan nama di belakang email (contoh: `johndoewahid@domain.xyz`)
+- Auto-retry jika gagal (buat akun baru otomatis)
 - Penyimpanan hasil ke `data/accounts.json` dan auto-ekspor ke `data/result.txt`
-- Konfigurasi terpusat via `config.json` (password, domain, headless, OTP, dll)
-- Stealth mode browser untuk menghindari deteksi bot
+- Konfigurasi terpusat via `config.json` (password, domain, OTP, dll)
 
 ## Persyaratan
 
 - Node.js v18 atau lebih baru
-- Google Chrome atau Microsoft Edge terinstall di sistem
 - Akun email domain kustom yang mendukung API inbox (default: `plexai.xyz`)
 
 ## Instalasi
@@ -60,7 +61,6 @@ Edit file `config.json` di root project:
   "password": "@Gopretstudio88",
   "domains": ["plexai.xyz"],
   "batchSize": 5,
-  "headless": true,
   "otp": {
     "timeout": 90000,
     "pollInterval": 4000,
@@ -80,7 +80,6 @@ Edit file `config.json` di root project:
 | `password` | Password untuk semua akun yang dibuat |
 | `domains` | Daftar domain email (array) |
 | `batchSize` | Maksimal akun diproses bersamaan |
-| `headless` | `true` = browser tidak terlihat, `false` = browser ditampilkan |
 | `otp.timeout` | Timeout polling OTP dalam milidetik |
 | `otp.pollInterval` | Interval polling inbox dalam milidetik |
 | `otp.apiUrl` | URL API email server |
@@ -97,16 +96,16 @@ npm run create
 Sistem akan bertanya secara interaktif:
 
 ```
-🔢 Mau buat berapa akun? 5
-📝 Apakah ada penambahan nama di belakang email? (kosongkan jika tidak): wahid
+> Mau buat berapa akun? 5
+> Tambahan nama di belakang email? (kosongkan jika tidak): wahid
 ```
 
 Kemudian tampil live progress bar:
 
 ```
-  ✅ abc123wahid@plexai.xyz  │ ████████████████████ 100% │ Berhasil ✅
-  ⏳ def456wahid@plexai.xyz  │ ██████████░░░░░░░░░░  50% │ Menunggu kode OTP...
-  ⏸  —                       │ ░░░░░░░░░░░░░░░░░░░░   0% │ Menunggu...
+  ✅ johndoewahid@plexai.xyz       │ ████████████████████ 100% │ Berhasil
+  ⏳ emmastonewahid@plexai.xyz     │ ██████████░░░░░░░░░░  57% │ Menunggu kode OTP...
+  ⏸  —                             │ ░░░░░░░░░░░░░░░░░░░░   0% │ Menunggu...
 ```
 
 ### Ekspor Manual
@@ -132,11 +131,11 @@ chatgpt-account-creator/
 └── src/
     ├── config.js         # Wrapper baca config.json
     ├── commands/
-    │   ├── create.js     # Logika pembuatan akun (batch + progress bar)
+    │   ├── create.js     # Logika pembuatan akun (worker pool + progress bar)
     │   └── convert.js    # Ekspor ke result.txt
     └── lib/
-        ├── browser.js    # Setup browser Puppeteer + helpers
-        ├── register.js   # 6-step flow registrasi ChatGPT
+        ├── http-client.js # Cookie jar & fetch wrapper untuk cross-domain
+        ├── register.js   # 7-step flow registrasi ChatGPT via fetch
         ├── otp.js        # Polling OTP dari inbox email
         ├── email-gen.js  # Generate email & nama (faker.js)
         └── storage.js    # Read/write accounts + LocalDB email
@@ -144,14 +143,15 @@ chatgpt-account-creator/
 
 ## Alur Kerja Registrasi
 
-Setiap akun diproses melalui 6 langkah:
+Setiap akun diproses melalui 7 langkah via direct HTTP fetch:
 
-1. Setup OAuth - ambil CSRF token, dapatkan URL auth0
-2. Isi password - navigasi ke halaman registrasi, isi password
-3. Verifikasi OTP - polling inbox otomatis, isi kode 6 digit
-4. Isi profil - nama lengkap (faker.js) dan tanggal lahir acak (2000-2005)
-5. Ambil session - ekstrak access token dari sesi aktif
-6. Simpan & selesai - data akun disimpan ke `accounts.json` & `result.txt`
+1. **CSRF Token** — ambil token dari `chatgpt.com/api/auth/csrf`
+2. **OAuth Signin** — POST ke `api/auth/signin/openai` → dapatkan authorize URL
+3. **Authorize** — follow redirect chain → capture auth cookies
+4. **Register** — POST email + password ke `auth.openai.com`
+5. **OTP** — kirim & tunggu kode OTP (auto-resend hingga 2x jika tidak masuk)
+6. **Validasi OTP** — verifikasi kode 6 digit
+7. **Buat Akun** — isi nama + tanggal lahir → callback → ambil session token
 
 ## Format Output
 
@@ -160,14 +160,14 @@ Setiap akun diproses melalui 6 langkah:
 ```json
 [
   {
-    "email": "abc123wahid@plexai.xyz",
+    "email": "isabellathompsonwahid@plexai.xyz",
     "password": "@Gopretstudio88",
     "fullName": "Isabella Thompson",
     "birthdate": "2002-05-14",
     "status": "verified",
     "userId": "...",
     "accessToken": "...",
-    "createdAt": "2025-03-11T00:00:00.000Z"
+    "createdAt": "2026-04-08T00:00:00.000Z"
   }
 ]
 ```
@@ -175,14 +175,15 @@ Setiap akun diproses melalui 6 langkah:
 ### `data/result.txt`
 
 ```
-abc123wahid@plexai.xyz    Isabella Thompson
-def456wahid@plexai.xyz    Marcus Chen
+isabellathompsonwahid@plexai.xyz    Isabella Thompson
+marcuschenwahid@plexai.xyz          Marcus Chen
 ```
 
 ## Catatan
 
-- Browser default berjalan headless; ubah `"headless": false` di `config.json` untuk menampilkan
-- Jika ada kegagalan di step manapun, sistem otomatis membuat akun baru tanpa menampilkan error
+- **Tidak memerlukan browser** — semua proses via HTTP fetch langsung
+- Jika ada kegagalan di step manapun, sistem otomatis membuat akun baru
+- OTP otomatis di-resend jika tidak masuk dalam 10 detik (maksimal 2x resend)
 - File `data/email-db.json` menyimpan semua email yang pernah digunakan (tidak pernah dihapus)
 - Hanya akun free yang dibuat — tidak ada proses pembayaran atau kartu kredit
 - Pastikan domain email yang digunakan mendukung catchall/API inbox

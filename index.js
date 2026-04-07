@@ -18,8 +18,8 @@ function banner() {
   console.log(
     chalk.cyan.bold(`
 ╔══════════════════════════════════════╗
-║   🤖 ChatGPT Account Creator v3.0   ║
-║      Auto-register via web flow      ║
+║  🚀 ChatGPT Account Creator v4.0   ║
+║     Fetch-based (no browser!)       ║
 ╚══════════════════════════════════════╝`),
   );
 }

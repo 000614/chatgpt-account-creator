@@ -1,7 +1,8 @@
 /**
  * commands/create.js
  * Command: npm run create
- * Buat N akun ChatGPT secara parallel (max BATCH_SIZE sekaligus).
+ * Buat N akun ChatGPT secara parallel dengan worker pool
+ * (max BATCH_SIZE aktif sekaligus, slot langsung dipakai ulang).
  */
 
 import chalk from "chalk";
@@ -33,16 +34,25 @@ function ask(question) {
   );
 }
 
-// ─── Generate email unik (cek LocalDB) ───────────────────────────────────────
-function generateUniqueAccount(emailSuffix = "") {
-  let account;
-  let attempts = 0;
-  do {
-    account = generateAccount(emailSuffix);
-    attempts++;
-    if (attempts > 100) break;
-  } while (isEmailUsed(account.email));
-  return account;
+// ─── Generate email unik (cek LocalDB + slot aktif) ──────────────────────────
+function generateUniqueAccount(emailSuffix = "", reservedEmails = new Set()) {
+  for (let attempts = 0; attempts < 100; attempts++) {
+    const account = generateAccount(emailSuffix);
+    if (!isEmailUsed(account.email) && !reservedEmails.has(account.email)) {
+      reservedEmails.add(account.email);
+      return account;
+    }
+  }
+
+  throw new Error("Gagal generate email unik setelah 100 percobaan");
+}
+
+function releaseReservedEmail(email, reservedEmails) {
+  if (email) reservedEmails.delete(email);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ─── Progress Bar ─────────────────────────────────────────────────────────────
@@ -68,29 +78,41 @@ function truncate(str, maxLen) {
 }
 
 class LiveDisplay {
-  constructor(slotCount) {
-    this.slotCount = slotCount;
-    this.slots = Array.from({ length: slotCount }, () => ({
+  constructor(totalCount) {
+    this.totalCount = totalCount;
+    this.numberWidth = Math.max(3, String(totalCount).length);
+    // Pre-allocate ALL rows so cursor offset is always constant
+    this.rows = Array.from({ length: totalCount }, () => ({
       email: "—",
       step: 0,
       status: "Menunggu...",
       done: false,
     }));
     this.rendered = false;
+    this._pendingRender = false;
   }
 
-  update(slotIdx, data) {
-    Object.assign(this.slots[slotIdx], data);
-    this.render();
+  updateRow(rowIdx, data) {
+    Object.assign(this.rows[rowIdx], data);
+    // Debounce: batch concurrent updates into a single render pass
+    if (!this._pendingRender) {
+      this._pendingRender = true;
+      queueMicrotask(() => {
+        this._pendingRender = false;
+        this._render();
+      });
+    }
   }
 
-  render() {
+  _render() {
+    // Move cursor up by FIXED total (never changes)
     if (this.rendered) {
-      process.stdout.write(`\x1B[${this.slotCount}A`);
+      process.stdout.write(`\x1B[${this.totalCount}A`);
     }
 
-    for (let i = 0; i < this.slotCount; i++) {
-      const s = this.slots[i];
+    for (let i = 0; i < this.totalCount; i++) {
+      const s = this.rows[i];
+      const rowNumber = `${String(i + 1).padStart(this.numberWidth, "0")}.`;
       const emailStr = truncate(s.email, EMAIL_WIDTH);
       const bar = renderBar(s.step, TOTAL_STEPS);
       const statusStr = truncate(s.status, STATUS_WIDTH);
@@ -101,7 +123,7 @@ class LiveDisplay {
       else icon = chalk.gray("⏸ ");
 
       process.stdout.write(
-        `\x1B[2K  ${icon} ${chalk.white.bold(emailStr)} │ ${bar} │ ${s.done ? chalk.green(statusStr) : chalk.gray(statusStr)}\n`,
+        `\x1B[2K  ${chalk.gray(rowNumber)} ${icon} ${chalk.white.bold(emailStr)} │ ${bar} │ ${s.done ? chalk.green(statusStr) : chalk.gray(statusStr)}\n`,
       );
     }
 
@@ -136,12 +158,12 @@ export async function cmdCreate(args) {
   if (emailSuffix) {
     console.log(
       chalk.green(
-        `  ✓ Suffix email: "${emailSuffix}" → contoh: abc123${emailSuffix}@domain.xyz`,
+        `  ✓ Suffix email: "${emailSuffix}" → contoh: johndoe${emailSuffix}@domain.xyz`,
       ),
     );
   } else {
     console.log(
-      chalk.gray(`  ✓ Email tanpa tambahan → contoh: abc1234567@domain.xyz`),
+      chalk.gray(`  ✓ Email tanpa tambahan → contoh: johndoe@domain.xyz`),
     );
   }
 
@@ -153,43 +175,44 @@ export async function cmdCreate(args) {
     chalk.gray(`\n> 🗑️  Data lama dihapus (accounts.json & result.txt)\n`),
   );
 
-  // Bagi slot ke batch
-  const slots = Array.from({ length: count }, (_, i) => i);
-  const batches = [];
-  for (let i = 0; i < slots.length; i += BATCH_SIZE) {
-    batches.push(slots.slice(i, i + BATCH_SIZE));
-  }
-
+  const workerCount = Math.min(count, BATCH_SIZE);
+  const reservedEmails = new Set();
+  let nextAccountIndex = 0;
   let totalSuccess = 0;
-  const allResults = [];
+  const allResults = new Array(count);
 
-  for (let bIdx = 0; bIdx < batches.length; bIdx++) {
-    const batch = batches[bIdx];
-    const allDone = () =>
-      batchDisplay && batchDisplay.slots.every((s) => s.done);
+  const liveDisplay = new LiveDisplay(count);
+  liveDisplay._render(); // Print initial grid before workers start
 
-    // ─── Batch header ─────────────────────────────────────────────────────
-    const batchLabel = `Batch ${bIdx + 1}/${batches.length} (${batch.length} akun)`;
-    const headerLine = `${"─".repeat(80)}`;
+  const workers = Array.from({ length: workerCount }, () =>
+    (async () => {
+      while (true) {
+        if (nextAccountIndex >= count) {
+          return;
+        }
 
-    // Print batch header (will be updated when done)
-    const headerLineCount = 1;
-    console.log(
-      chalk.yellow(`⏳ ${batchLabel} `) + chalk.gray(headerLine),
-    );
+        const accountIndex = nextAccountIndex++;
 
-    const batchDisplay = new LiveDisplay(batch.length);
-    batchDisplay.render();
-
-    const results = await Promise.allSettled(
-      batch.map(async (slotIdx, localIdx) => {
         while (true) {
-          const account = generateUniqueAccount(emailSuffix);
+          let account;
 
-          batchDisplay.update(localIdx, {
+          try {
+            account = generateUniqueAccount(emailSuffix, reservedEmails);
+          } catch {
+            liveDisplay.updateRow(accountIndex, {
+              email: "—",
+              step: 0,
+              status: "Mencari email unik...",
+              done: false,
+            });
+            await sleep(1000);
+            continue;
+          }
+
+          liveDisplay.updateRow(accountIndex, {
             email: account.email,
             step: 0,
-            status: "Memulai registrasi...",
+            status: "Memulai...",
             done: false,
           });
 
@@ -197,68 +220,44 @@ export async function cmdCreate(args) {
             const result = await registerAccount(account, {
               askOtpFn: getOtp,
               onProgress: (step, msg) => {
-                batchDisplay.update(localIdx, { step, status: msg });
+                liveDisplay.updateRow(accountIndex, {
+                  step,
+                  status: msg,
+                });
               },
             });
+
             await saveAccount(result);
             await saveEmailToDb(account.email);
+            releaseReservedEmail(account.email, reservedEmails);
 
-            batchDisplay.update(localIdx, {
+            allResults[accountIndex] = result;
+            totalSuccess++;
+
+            liveDisplay.updateRow(accountIndex, {
               step: TOTAL_STEPS,
-              status: "Berhasil ✅",
+              status: "Berhasil",
               done: true,
             });
-
-            return result;
+            break;
           } catch {
-            batchDisplay.update(localIdx, {
+            releaseReservedEmail(account.email, reservedEmails);
+            liveDisplay.updateRow(accountIndex, {
               step: 0,
-              status: "Membuat akun baru...",
+              status: "Gagal, retry...",
               done: false,
             });
-            await new Promise((r) =>
-              setTimeout(r, 3000 + Math.random() * 2000),
-            );
+            await sleep(3000 + Math.random() * 2000);
           }
         }
-      }),
-    );
+      }
+    })(),
+  );
 
-    // Update batch header → done
-    const linesUp = batch.length + headerLineCount;
-    process.stdout.write(`\x1B[${linesUp}A`);
-    process.stdout.write(
-      `\x1B[2K${chalk.green(`✅ ${batchLabel} `)}${chalk.gray(headerLine)}\n`,
-    );
-    // Re-render slots below (cursor is now at slot area)
-    for (let i = 0; i < batch.length; i++) {
-      const s = batchDisplay.slots[i];
-      const emailStr = truncate(s.email, EMAIL_WIDTH);
-      const bar = renderBar(s.step, TOTAL_STEPS);
-      const statusStr = truncate(s.status, STATUS_WIDTH);
-      process.stdout.write(
-        `\x1B[2K  ${chalk.green("✅")} ${chalk.white.bold(emailStr)} │ ${bar} │ ${chalk.green(statusStr)}\n`,
-      );
-    }
-
-    const batchSuccess = results.filter(
-      (r) => r.status === "fulfilled",
-    ).length;
-    totalSuccess += batchSuccess;
-
-    results.forEach((r) => {
-      if (r.status === "fulfilled") allResults.push(r.value);
-    });
-
-    if (bIdx < batches.length - 1) {
-      await new Promise((r) =>
-        setTimeout(r, 3000 + Math.random() * 2000),
-      );
-    }
-  }
+  await Promise.allSettled(workers);
 
   // ─── Auto-convert & simpan ─────────────────────────────────────────────
-  autoConvert(allResults);
+  autoConvert(allResults.filter(Boolean));
 
   console.log(
     chalk.green(`\n✅ Selesai! ${totalSuccess}/${count} akun berhasil dibuat.`),

@@ -4,11 +4,11 @@
 
 # ChatGPT Account Creator
 
-**A CLI tool for bulk automation of ChatGPT account creation via headless browser.**
+**A CLI tool for bulk automation of ChatGPT account creation via direct HTTP fetch (no browser needed).**
 
-![Version](https://img.shields.io/badge/Version-3.0.0-blueviolet)
+![Version](https://img.shields.io/badge/Version-4.0.0-blueviolet)
 ![Node](https://img.shields.io/badge/Node.js-v18+-green)
-![Runtime](https://img.shields.io/badge/Runtime-Puppeteer-orange)
+![Runtime](https://img.shields.io/badge/Runtime-Fetch_API-blue)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
 
 [Features](#features) - [Installation](#installation) - [Usage](#usage) - [Structure](#project-structure) - [License](#license)
@@ -19,28 +19,29 @@
 
 ---
 
-> **Disclaimer:** This project is created solely for **educational purposes and browser automation research**. Using this tool to violate OpenAI's Terms of Service, abuse the platform, or engage in any illegal activity is entirely the responsibility of the user. The author assumes no liability for any misuse.
+> **Disclaimer:** This project is created solely for **educational purposes and automation research**. Using this tool to violate OpenAI's Terms of Service, abuse the platform, or engage in any illegal activity is entirely the responsibility of the user. The author assumes no liability for any misuse.
 
 ---
 
 ## Features
 
-- Automated ChatGPT account creation via the official web registration flow
-- Parallel processing of up to 5 accounts simultaneously (batch processing)
+- Automated ChatGPT account creation via **direct HTTP fetch** (no browser required)
+- **Much faster** than browser-based approach — pure API calls
+- Parallel processing of up to 5 accounts simultaneously with a worker pool
 - **Live progress bar** per-account with real-time ANSI terminal display
 - Automatic OTP verification from email inbox via API polling
-- **Realistic random names** using faker.js (symbols automatically stripped)
+- **Auto-resend OTP** — if OTP doesn't arrive within 10 seconds, auto-resend up to 2 times
+- **Realistic random names** using faker.js (letters/spaces only, no symbols)
 - **Unique emails** — LocalDB ensures no duplicate emails across sessions
-- **Optional email suffix** — append a name to the email (e.g. `abc123wahid@domain.xyz`)
-- Unlimited auto-retry on failure (silently creates a new account, no errors shown)
+- **Name-based emails** — email usernames reuse the generated faker.js first + last name
+- **Optional email suffix** — append a name to the email (e.g. `johndoewahid@domain.xyz`)
+- Auto-retry on failure (automatically creates a new account)
 - Results saved to `data/accounts.json` and auto-exported to `data/result.txt`
-- Centralized configuration via `config.json` (password, domain, headless, OTP, etc.)
-- Browser stealth mode to avoid bot detection
+- Centralized configuration via `config.json` (password, domain, OTP, etc.)
 
 ## Requirements
 
 - Node.js v18 or newer
-- Google Chrome or Microsoft Edge installed on the system
 - Custom email domain with inbox API support (default: `plexai.xyz`)
 
 ## Installation
@@ -60,7 +61,6 @@ Edit `config.json` in the project root:
   "password": "@Gopretstudio88",
   "domains": ["plexai.xyz"],
   "batchSize": 5,
-  "headless": true,
   "otp": {
     "timeout": 90000,
     "pollInterval": 4000,
@@ -80,7 +80,6 @@ Edit `config.json` in the project root:
 | `password` | Password used for all created accounts |
 | `domains` | List of email domains (array) |
 | `batchSize` | Max accounts processed in parallel |
-| `headless` | `true` = invisible browser, `false` = visible browser window |
 | `otp.timeout` | OTP polling timeout in milliseconds |
 | `otp.pollInterval` | Inbox polling interval in milliseconds |
 | `otp.apiUrl` | Email server API URL |
@@ -97,16 +96,16 @@ npm run create
 The system will ask interactively:
 
 ```
-🔢 Mau buat berapa akun? 5
-📝 Apakah ada penambahan nama di belakang email? (kosongkan jika tidak): wahid
+> Mau buat berapa akun? 5
+> Tambahan nama di belakang email? (kosongkan jika tidak): wahid
 ```
 
 Then displays a live progress bar:
 
 ```
-  ✅ abc123wahid@plexai.xyz  │ ████████████████████ 100% │ Berhasil ✅
-  ⏳ def456wahid@plexai.xyz  │ ██████████░░░░░░░░░░  50% │ Menunggu kode OTP...
-  ⏸  —                       │ ░░░░░░░░░░░░░░░░░░░░   0% │ Menunggu...
+  ✅ johndoewahid@plexai.xyz       │ ████████████████████ 100% │ Berhasil
+  ⏳ emmastonewahid@plexai.xyz     │ ██████████░░░░░░░░░░  57% │ Menunggu kode OTP...
+  ⏸  —                             │ ░░░░░░░░░░░░░░░░░░░░   0% │ Menunggu...
 ```
 
 ### Manual Export
@@ -132,11 +131,11 @@ chatgpt-account-creator/
 └── src/
     ├── config.js         # Wrapper for reading config.json
     ├── commands/
-    │   ├── create.js     # Account creation logic (batch + progress bar)
+    │   ├── create.js     # Account creation logic (worker pool + progress bar)
     │   └── convert.js    # Export to result.txt
     └── lib/
-        ├── browser.js    # Puppeteer browser setup + helpers
-        ├── register.js   # 6-step ChatGPT registration flow
+        ├── http-client.js # Cookie jar & fetch wrapper for cross-domain requests
+        ├── register.js   # 7-step ChatGPT registration flow via fetch
         ├── otp.js        # OTP polling from email inbox
         ├── email-gen.js  # Email & name generator (faker.js)
         └── storage.js    # Read/write accounts + LocalDB email
@@ -144,14 +143,15 @@ chatgpt-account-creator/
 
 ## Registration Flow
 
-Each account is processed through 6 steps:
+Each account is processed through 7 steps via direct HTTP fetch:
 
-1. OAuth setup - fetch CSRF token, obtain auth0 redirect URL
-2. Password entry - navigate to registration page, fill in password
-3. OTP verification - auto-poll inbox, enter the 6-digit code
-4. Profile setup - full name (faker.js) and random date of birth (2000-2005)
-5. Session retrieval - extract access token from active session
-6. Save & done - account data saved to `accounts.json` & `result.txt`
+1. **CSRF Token** — fetch token from `chatgpt.com/api/auth/csrf`
+2. **OAuth Signin** — POST to `api/auth/signin/openai` → get authorize URL
+3. **Authorize** — follow redirect chain → capture auth cookies
+4. **Register** — POST email + password to `auth.openai.com`
+5. **OTP** — send & wait for OTP code (auto-resend up to 2x if not received)
+6. **Validate OTP** — verify the 6-digit code
+7. **Create Account** — fill name + birthdate → callback → get session token
 
 ## Output Format
 
@@ -160,14 +160,14 @@ Each account is processed through 6 steps:
 ```json
 [
   {
-    "email": "abc123wahid@plexai.xyz",
+    "email": "isabellathompsonwahid@plexai.xyz",
     "password": "@Gopretstudio88",
     "fullName": "Isabella Thompson",
     "birthdate": "2002-05-14",
     "status": "verified",
     "userId": "...",
     "accessToken": "...",
-    "createdAt": "2025-03-11T00:00:00.000Z"
+    "createdAt": "2026-04-08T00:00:00.000Z"
   }
 ]
 ```
@@ -175,14 +175,15 @@ Each account is processed through 6 steps:
 ### `data/result.txt`
 
 ```
-abc123wahid@plexai.xyz    Isabella Thompson
-def456wahid@plexai.xyz    Marcus Chen
+isabellathompsonwahid@plexai.xyz    Isabella Thompson
+marcuschenwahid@plexai.xyz          Marcus Chen
 ```
 
 ## Notes
 
-- Browser runs headless by default; set `"headless": false` in `config.json` to show the window
-- On any failure at any step, the system automatically creates a new account without displaying errors
+- **No browser required** — all processing via direct HTTP fetch
+- On any failure, the system automatically creates a new account
+- OTP is automatically resent if not received within 10 seconds (max 2 resends)
 - `data/email-db.json` stores all previously used emails (never deleted)
 - Only free accounts are created — no payment or credit card information is used
 - Ensure your email domain supports catchall addresses or an inbox API

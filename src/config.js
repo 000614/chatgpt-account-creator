@@ -18,7 +18,6 @@ export const DOMAINS = config.domains;
 
 // ─── Proses ───────────────────────────────────────────────────────────────────
 export const BATCH_SIZE = config.batchSize;
-export const HEADLESS = config.headless;
 
 // ─── OTP ──────────────────────────────────────────────────────────────────────
 export const OTP_TIMEOUT = config.otp.timeout;
