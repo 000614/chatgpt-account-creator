@@ -1,26 +1,17 @@
 /**
- * commands/create.js
- * Command: npm run create
- * Buat N akun ChatGPT secara parallel dengan worker pool
- * (max BATCH_SIZE aktif sekaligus, slot langsung dipakai ulang).
+ * commands/create.js (网页邮箱手动交互版)
  */
 
 import chalk from "chalk";
 import readline from "readline";
 import { writeFileSync, existsSync, unlinkSync } from "fs";
 import { resolve } from "path";
-import { BATCH_SIZE, RESULT_FILE } from "../config.js";
-import { generateAccount } from "../lib/email-gen.js";
+import { RESULT_FILE, PASSWORD } from "../config.js";
+import { generateName } from "../lib/email-gen.js";
 import { registerAccount, TOTAL_STEPS } from "../lib/register.js";
-import { waitForOtp } from "../lib/otp.js";
-import {
-  saveAccount,
-  clearAccounts,
-  isEmailUsed,
-  saveEmailToDb,
-} from "../lib/storage.js";
+import { saveAccount, clearAccounts, saveEmailToDb } from "../lib/storage.js";
 
-// ─── Helper: Prompt input ─────────────────────────────────────────────────────
+// 在终端中请求用户输入的辅助函数
 function ask(question) {
   const rl = readline.createInterface({
     input: process.stdin,
@@ -34,238 +25,75 @@ function ask(question) {
   );
 }
 
-// ─── Generate email unik (cek LocalDB + slot aktif) ──────────────────────────
-function generateUniqueAccount(emailSuffix = "", reservedEmails = new Set()) {
-  for (let attempts = 0; attempts < 100; attempts++) {
-    const account = generateAccount(emailSuffix);
-    if (!isEmailUsed(account.email) && !reservedEmails.has(account.email)) {
-      reservedEmails.add(account.email);
-      return account;
-    }
-  }
-
-  throw new Error("Gagal generate email unik setelah 100 percobaan");
-}
-
-function releaseReservedEmail(email, reservedEmails) {
-  if (email) reservedEmails.delete(email);
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// ─── Progress Bar ─────────────────────────────────────────────────────────────
-
-const BAR_WIDTH = 20;
-const EMAIL_WIDTH = 30;
-const STATUS_WIDTH = 40;
-
-function renderBar(step, total) {
-  const pct = Math.round((step / total) * 100);
-  const filled = Math.round((step / total) * BAR_WIDTH);
-  const empty = BAR_WIDTH - filled;
-  const bar = "█".repeat(filled) + "░".repeat(empty);
-
-  if (pct === 100) return chalk.green(`${bar} ${String(pct).padStart(3)}%`);
-  if (pct >= 50) return chalk.yellow(`${bar} ${String(pct).padStart(3)}%`);
-  return chalk.cyan(`${bar} ${String(pct).padStart(3)}%`);
-}
-
-function truncate(str, maxLen) {
-  if (str.length <= maxLen) return str.padEnd(maxLen);
-  return str.slice(0, maxLen - 1) + "…";
-}
-
-class LiveDisplay {
-  constructor(totalCount) {
-    this.totalCount = totalCount;
-    this.numberWidth = Math.max(3, String(totalCount).length);
-    // Pre-allocate ALL rows so cursor offset is always constant
-    this.rows = Array.from({ length: totalCount }, () => ({
-      email: "—",
-      step: 0,
-      status: "Menunggu...",
-      done: false,
-    }));
-    this.rendered = false;
-    this._pendingRender = false;
-  }
-
-  updateRow(rowIdx, data) {
-    Object.assign(this.rows[rowIdx], data);
-    // Debounce: batch concurrent updates into a single render pass
-    if (!this._pendingRender) {
-      this._pendingRender = true;
-      queueMicrotask(() => {
-        this._pendingRender = false;
-        this._render();
-      });
-    }
-  }
-
-  _render() {
-    // Move cursor up by FIXED total (never changes)
-    if (this.rendered) {
-      process.stdout.write(`\x1B[${this.totalCount}A`);
-    }
-
-    for (let i = 0; i < this.totalCount; i++) {
-      const s = this.rows[i];
-      const rowNumber = `${String(i + 1).padStart(this.numberWidth, "0")}.`;
-      const emailStr = truncate(s.email, EMAIL_WIDTH);
-      const bar = renderBar(s.step, TOTAL_STEPS);
-      const statusStr = truncate(s.status, STATUS_WIDTH);
-
-      let icon;
-      if (s.done) icon = chalk.green("✅");
-      else if (s.step > 0) icon = chalk.yellow("⏳");
-      else icon = chalk.gray("⏸ ");
-
-      process.stdout.write(
-        `\x1B[2K  ${chalk.gray(rowNumber)} ${icon} ${chalk.white.bold(emailStr)} │ ${bar} │ ${s.done ? chalk.green(statusStr) : chalk.gray(statusStr)}\n`,
-      );
-    }
-
-    this.rendered = true;
-  }
-}
-
-// ─── OTP ──────────────────────────────────────────────────────────────────────
-async function getOtp(email) {
-  return await waitForOtp(email);
-}
-
-// ─── Auto-convert ─────────────────────────────────────────────────────────────
-function autoConvert(allResults) {
-  if (allResults.length === 0) return;
-  const lines = allResults.map(
-    (acc) => `${acc.email}\t${acc.fullName || acc.firstName || "-"}`,
-  );
-  writeFileSync(resolve(RESULT_FILE), lines.join("\n"), "utf-8");
-}
-
-// ─── Main ─────────────────────────────────────────────────────────────────────
 export async function cmdCreate(args) {
-  // ─── Prompt interaktif ─────────────────────────────────────────────────
-  const countInput = await ask(chalk.white(`> Mau buat berapa akun? `));
+  console.log(chalk.cyan.bold(`\n=== 半自动模式 (手动输入网页邮箱) ===\n`));
+  
+  const countInput = await ask(chalk.white(`> 你想创建多少个账号？ `));
   const count = Math.max(1, parseInt(countInput) || 1);
 
-  const emailSuffix = await ask(
-    chalk.white(`> Tambahan nama di belakang email? (kosongkan jika tidak): `),
-  );
-
-  if (emailSuffix) {
-    console.log(
-      chalk.green(
-        `  ✓ Suffix email: "${emailSuffix}" → contoh: johndoe${emailSuffix}@domain.xyz`,
-      ),
-    );
-  } else {
-    console.log(
-      chalk.gray(`  ✓ Email tanpa tambahan → contoh: johndoe@domain.xyz`),
-    );
-  }
-
-  // ─── Hapus data lama ───────────────────────────────────────────────────
+  // 清除旧数据
   await clearAccounts();
   const resultPath = resolve(RESULT_FILE);
   if (existsSync(resultPath)) unlinkSync(resultPath);
-  console.log(
-    chalk.gray(`\n> 🗑️  Data lama dihapus (accounts.json & result.txt)\n`),
-  );
+  console.log(chalk.gray(`\n> 🗑️  旧数据已清除 (accounts.json & result.txt)`));
 
-  const workerCount = Math.min(count, BATCH_SIZE);
-  const reservedEmails = new Set();
-  let nextAccountIndex = 0;
+  const allResults = [];
   let totalSuccess = 0;
-  const allResults = new Array(count);
 
-  const liveDisplay = new LiveDisplay(count);
-  liveDisplay._render(); // Print initial grid before workers start
+  // 逐个创建账号（取消并行，防止输入验证码时发生冲突）
+  for (let i = 0; i < count; i++) {
+    console.log(chalk.cyan(`\n===========================================`));
+    console.log(chalk.cyan(`         正在创建账号 ${i + 1} / ${count}`));
+    console.log(chalk.cyan(`===========================================`));
+    
+    const email = await ask(chalk.yellow(`\n[1] 请打开提供临时邮箱的网站（例如：mail.tm）\n> 请输入你获取到的邮箱地址： `));
+    
+    if (!email) {
+        console.log(chalk.red(`邮箱为空，跳过此账号...`));
+        continue;
+    }
 
-  const workers = Array.from({ length: workerCount }, () =>
-    (async () => {
-      while (true) {
-        if (nextAccountIndex >= count) {
-          return;
-        }
+    // 随机生成姓名，并与你输入的邮箱和配置的密码绑定
+    const nameInfo = generateName();
+    const account = { 
+      email, 
+      password: PASSWORD, 
+      ...nameInfo 
+    };
 
-        const accountIndex = nextAccountIndex++;
+    try {
+      const result = await registerAccount(account, {
+        // 重写获取 OTP 的函数，改为请求你手动输入
+        askOtpFn: async (sentEmail) => {
+          console.log(chalk.magenta.bold(`\n[!] OpenAI 已将 6 位数验证码发送至：${sentEmail}`));
+          return await ask(chalk.yellow(`[2] 请去你的网页邮箱查收邮件。\n> 请在此输入你收到的 OTP 验证码： `));
+        },
+        // 使用简单的日志输出进度，不使用容易冲突的 UI 渲染
+        onProgress: (step, msg) => {
+          console.log(chalk.gray(`   [步骤 ${step}/${TOTAL_STEPS}] ${msg}`));
+        },
+      });
 
-        while (true) {
-          let account;
+      // 注册成功后保存数据
+      await saveAccount(result);
+      await saveEmailToDb(account.email);
+      allResults.push(result);
+      totalSuccess++;
+      console.log(chalk.green(`\n✅ 成功！账号已准备就绪：${email}`));
+      
+    } catch (err) {
+      console.error(chalk.red(`\n❌ 失败：${err.message}`));
+    }
+  }
 
-          try {
-            account = generateUniqueAccount(emailSuffix, reservedEmails);
-          } catch {
-            liveDisplay.updateRow(accountIndex, {
-              email: "—",
-              step: 0,
-              status: "Mencari email unik...",
-              done: false,
-            });
-            await sleep(1000);
-            continue;
-          }
+  // 导出到 txt 文件
+  if (allResults.length > 0) {
+    const lines = allResults.map(
+      (acc) => `${acc.email}\t${acc.fullName || acc.firstName || "-"}`
+    );
+    writeFileSync(resolve(RESULT_FILE), lines.join("\n"), "utf-8");
+  }
 
-          liveDisplay.updateRow(accountIndex, {
-            email: account.email,
-            step: 0,
-            status: "Memulai...",
-            done: false,
-          });
-
-          try {
-            const result = await registerAccount(account, {
-              askOtpFn: getOtp,
-              onProgress: (step, msg) => {
-                liveDisplay.updateRow(accountIndex, {
-                  step,
-                  status: msg,
-                });
-              },
-            });
-
-            await saveAccount(result);
-            await saveEmailToDb(account.email);
-            releaseReservedEmail(account.email, reservedEmails);
-
-            allResults[accountIndex] = result;
-            totalSuccess++;
-
-            liveDisplay.updateRow(accountIndex, {
-              step: TOTAL_STEPS,
-              status: "Berhasil",
-              done: true,
-            });
-            break;
-          } catch {
-            releaseReservedEmail(account.email, reservedEmails);
-            liveDisplay.updateRow(accountIndex, {
-              step: 0,
-              status: "Gagal, retry...",
-              done: false,
-            });
-            await sleep(3000 + Math.random() * 2000);
-          }
-        }
-      }
-    })(),
-  );
-
-  await Promise.allSettled(workers);
-
-  // ─── Auto-convert & simpan ─────────────────────────────────────────────
-  autoConvert(allResults.filter(Boolean));
-
-  console.log(
-    chalk.green(`\n✅ Selesai! ${totalSuccess}/${count} akun berhasil dibuat.`),
-  );
-  console.log(
-    chalk.gray(`💾 Tersimpan di: `) +
-      chalk.cyan(`data/accounts.json`) +
-      chalk.gray(` & `) +
-      chalk.cyan(`data/result.txt\n`),
-  );
+  console.log(chalk.green.bold(`\n🎉 任务结束！成功创建了 ${totalSuccess}/${count} 个账号。`));
+  console.log(chalk.gray(`💾 数据已保存至 data/accounts.json 和 data/result.txt\n`));
 }

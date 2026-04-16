@@ -131,47 +131,9 @@ export async function registerAccount(account, opts = {}) {
   });
   await otpPage.text();
 
-  // Poll OTP with resend: try 10s → resend → 10s → resend → 10s → give up
-  const OTP_POLL_MS = 10_000;
-  const MAX_RESENDS = 2;
-  let otpCode = null;
-
-  for (let attempt = 0; attempt <= MAX_RESENDS; attempt++) {
-    if (attempt > 0) {
-      progress(5, `Resend OTP (${attempt}/${MAX_RESENDS})...`);
-      await fetchCookie(
-        jar,
-        "https://auth.openai.com/api/accounts/email-otp/resend",
-        {
-          method: "POST",
-          headers: {
-            Accept: "*/*",
-            Origin: "https://auth.openai.com",
-            Referer: "https://auth.openai.com/email-verification",
-          },
-        },
-      );
-    }
-
-    progress(5, attempt > 0
-      ? `Menunggu OTP (resend ${attempt})...`
-      : "Menunggu kode OTP dari email...");
-
-    try {
-      otpCode = await Promise.race([
-        askOtpFn(email),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("timeout")), OTP_POLL_MS),
-        ),
-      ]);
-      if (otpCode) break;
-    } catch {
-      if (attempt === MAX_RESENDS) {
-        throw new Error("OTP tidak diterima setelah 2x resend");
-      }
-    }
-  }
-
+// 手动模式：完全移除超时和自动重发逻辑，无限期等待用户输入
+  progress(5, "Menunggu kode OTP dari email...");
+  const otpCode = await askOtpFn(email);
   progress(5, "OTP diterima ✓");
 
   // ── Step 6: Validate OTP ────────────────────────────────────────────────
